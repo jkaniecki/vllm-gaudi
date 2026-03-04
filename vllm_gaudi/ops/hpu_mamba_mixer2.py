@@ -383,9 +383,9 @@ class HPUMambaMixer2(MambaMixer2):
             #   "state_indices_tensor"), it will write additional cache
             #   states aligned at "block_size_to_align".
             assert padding_mask_flat is not None
-            x = hidden_states_B_C.transpose(0, 1)  # this is the form that causal-conv see
             hidden_states_B_C = hidden_states_B_C * padding_mask_flat
             dt = dt * padding_mask_flat
+            x = hidden_states_B_C.transpose(0, 1)  # this is the form that causal-conv see
 
             hidden_states_B_C = hpu_causal_conv1d_fn(
                 x,
