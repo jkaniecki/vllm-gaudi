@@ -30,6 +30,9 @@ def new_chunk_cumsum(dt,
     dt_min, dt_max = dt_limit
 
     dt = dt.float()
+    if padding_mask is not None:
+        dt = dt * padding_mask.view(seqlen, 1).float()
+
     if dt_bias is not None:
         assert dt_bias.shape == (nheads, )
         dt += dt_bias.view(1, nheads).float()
