@@ -436,22 +436,48 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
-    if "GraniteMoeHybridForCausalLM" not in getattr(model.config, 'architectures', []):
-        return
+    mamba_like_arch = [
+        "GraniteMoeHybridForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    ]
+    if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
+        return False
+    mamba_like_layer = ['.mixer', '.linear_attn']
 
+    def _get_decoder_layer_by_idx(model_obj, idx: int):
+        # Qwen3.5 multimodal path: model.language_model.model.layers
+        if hasattr(model_obj, "language_model") and hasattr(model_obj.language_model, "model"):
+            layers = getattr(model_obj.language_model.model, "layers", None)
+            if layers is not None:
+                return layers[idx]
+        # Text-only path: model.model.layers
+        if hasattr(model_obj, "model"):
+            layers = getattr(model_obj.model, "layers", None)
+            if layers is not None:
+                return layers[idx]
+        return None
+
+    gdn_hybrid = False
     # Iterate through all KV cache groups
     for group_idx, kv_group in enumerate(kv_cache_config.kv_cache_groups):
         # kv_group.layer_names contains strings like "model.layers.5.mixer"
         for layer_name in kv_group.layer_names:
-            # Extract layer index from name (e.g., "model.layers.5.mixer" -> 5)
-            if ".mixer" in layer_name:  # Only process mamba layers
-                parts = layer_name.split('.')
-                layer_idx = int(parts[2])  # "model.layers.5.mixer" -> 5
+            if not any(pattern in layer_name for pattern in mamba_like_layer):
+                continue
+            parts = layer_name.split('.')
+            layer_idx = int(parts[-2])
 
-                # Access the actual layer
+            if '.mixer' in layer_name:
                 layer = model.model.layers[layer_idx]
                 assert hasattr(layer, 'mamba')
                 layer.mamba.cache_group_idx = group_idx
+            elif '.linear_attn' in layer_name:
+                layer = _get_decoder_layer_by_idx(model, layer_idx)
+                if layer is not None and hasattr(layer, "linear_attn"):
+                    layer.linear_attn.cache_group_idx = group_idx
+                    gdn_hybrid = True
+    return gdn_hybrid
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -473,6 +499,13 @@ def apply_model_specific_patches(model_runner):
     """The function applies model-specific monkey patches."""
     maybe_set_chunked_attention_layers(model_runner)
     patch_llama4_get_attn_scale(model_runner.model)
+
+
+def apply_model_patches_before_load(model_runner):
+    """Monkey-patch model classes before weights are loaded."""
+    import vllm.model_executor.models.qwen3_5 as qwen3_5
+    from vllm_gaudi.ops.hpu_gated_deltanet import HPUQwen3_5GatedDeltaNet
+    qwen3_5.Qwen3_5GatedDeltaNet = HPUQwen3_5GatedDeltaNet
 
 
 class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
@@ -898,8 +931,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        self.num_mamba_layers = self.model_config.get_num_layers_by_block_type(self.parallel_config, "mamba")
-        self.mamba_chunk_size = self.model_config.get_mamba_chunk_size() if self.num_mamba_layers > 0 else 0
+        self.num_mamba_layers = sum(
+            self.model_config.get_num_layers_by_block_type(self.parallel_config, block_type)
+            for block_type in ("mamba", "linear_attention")
+        )
+        # For HPU GDN (Qwen3.5), use configured chunk size when explicitly
+        # provided; otherwise default to 128 to match bucket alignment.
+        hf_text_config = self.model_config.hf_text_config
+        _mamba_chunk_explicit = (
+            self.num_mamba_layers > 0
+            and (
+                getattr(hf_text_config, "mamba_chunk_size", None) is not None
+                or getattr(hf_text_config, "chunk_size", None) is not None
+            )
+        )
+        if self.num_mamba_layers > 0:
+            self.mamba_chunk_size = (
+                self.model_config.get_mamba_chunk_size()
+                if _mamba_chunk_explicit
+                else 128
+            )
+        else:
+            self.mamba_chunk_size = 0
         self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
         self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',
                                                        'true').strip().lower() in ("1", "true")
@@ -4294,6 +4347,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         import habana_frameworks.torch.core as htcore
         if self._is_quant_with_inc() or self.model_config.quantization == 'fp8':
             htcore.hpu_inference_set_env()
+        apply_model_patches_before_load(self)
         logger.info("Starting to load model %s...", self.model_config.model)
         with HabanaMemoryProfiler() as m:  # noqa: SIM117
             # When load_config.device differs from the platform device (e.g.
@@ -5931,7 +5985,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.may_add_encoder_only_layers_to_kv_cache_config()
 
         if self.num_mamba_layers > 0:
-            maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
+            self.vllm_config.gdn_hybrid = maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
+        else:
+            self.vllm_config.gdn_hybrid = False
         # if len(kv_cache_config.kv_cache_groups) > 1:
         block_sizes = [kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups]
         if block_sizes != [self.cache_config.block_size]:
