@@ -35,16 +35,10 @@ class HPUAttentionBackendV1(HPUAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[Union[int, MultipleOf]]:
-        # 128 is the standard HPU kernel block size; 528 is required for
-        # Granite 4.0-H (granitemoehybrid) without prefix caching (16-token
-        # FA alignment), 768 with prefix caching (chunk-aligned).
-        return [MultipleOf(16)]
+        return [128]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # Always prefer 128-token HPU kernel blocks. For Granite 4.0-H,
-        # check_and_update_config computes the correct block size (528 or
-        # 768) before update_block_size_for_backend runs.
         return 128
 
 
